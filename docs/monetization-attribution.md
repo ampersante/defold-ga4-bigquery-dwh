@@ -46,7 +46,7 @@
  ──────────────────────────────────────────────────────────────────────────────────
  NAKAMA
   проверенные покупки и подписки; уведомления Apple (ASSN V2) и Google (RTDN) → refund_time / состояние подписки
-  ночная выгрузка по расписанию (cron на сервере) → nakama_purchases, nakama_subscriptions, nakama_subscription_events, nakama_users
+  ночная выгрузка по расписанию (cron на сервере) → nakama_purchases, nakama_subscriptions, nakama_subscription_events, nakama_users, nakama_ua_gcd
  API (ежедневные задания Cloud Run Jobs)
   MAX User-Level Ad Revenue API (данные на следующий день, D+1) → ad_impressions (выручка по каждому показу + player_id)
   MAX Revenue Reporting API                  → ad_revenue_agg     (сверка)
@@ -85,14 +85,31 @@
 
 ### 3.1 Источник
 
-Единственный бесплатный путь — **GCD (conversion data callback)**: AppsFlyer на устройстве сообщает игре данные атрибуции. DefAppsFlyer (расширение AppsFlyer для Defold) отдаёт весь нативный словарь как JSON [факт]. Игра логирует событие `ua_attribution` в Firebase:
+Единственный бесплатный путь — **GCD (conversion data callback)**: AppsFlyer на устройстве сообщает игре данные атрибуции. DefAppsFlyer (расширение AppsFlyer для Defold) отдаёт весь нативный словарь как JSON [факт]. Игра логирует событие `ua_attribution` в Firebase.
 
-| Параметр | Из GCD |
+**Какие ключи приходят.** У неорганических установок ключи `media_source`, `campaign`, `campaign_id`, `adset`, `adset_id`, `adgroup`, `adgroup_id`, `af_siteid`, `af_status`, `install_time`, `click_time`, `is_first_launch`, `af_sub1`–`af_sub5` и другие есть всегда, но значения могут быть пустыми (null). Сети с собственной атрибуцией (self-reporting: Meta, Google Ads, Apple Ads, TikTok, Snap) отдают свои наборы: Google Ads оставляет `adset_id` пустым и отдаёт `af_adset` / `af_adset_id` / `af_c_id`; Meta — `adgroup` / `adgroup_id` и `ad_id`; TikTok и Snap — поля `af_ad` / `af_adset`; имена кампаний и адсетов Apple Ads устарели. Остальные сети передают параметры ссылки как поля. Поля стоимости могут быть 0. Данные конверсии кешируются после первого колбэка [факт: support.appsflyer.com/hc/en-us/articles/360000726098].
+
+**Сопоставление.** Игра (Lua) заполняет параметры `ua_attribution` из JSON GCD: для каждого параметра берётся первое непустое значение из списка ключей. Пустое поле остаётся пустым, значения по умолчанию нет.
+
+| Параметр `ua_attribution` | Ключи GCD по порядку |
 |---|---|
-| af_status | Organic / Non-organic (установка без рекламы / с рекламы) |
-| media_source, campaign_id, campaign, adset_id, adset, ad | Канал и кампания (параметр события вмещает имена до 100 символов) |
-| install_time, is_first_launch | Время установки и признак первого запуска |
-| att_status (из игры) | Ответ игрока на запрос ATT (запрос Apple на отслеживание на iOS): authorized / denied / not_determined |
+| `af_status` | `af_status`: Organic / Non-organic (установка без рекламы / с рекламы) |
+| `media_source` | `media_source` |
+| `campaign` | `campaign` |
+| `campaign_id` | `campaign_id` → `af_c_id` |
+| `adset` | `adset` → `af_adset` |
+| `adset_id` | `adset_id` → `af_adset_id` |
+| `ad` | `adgroup` → `af_ad` |
+| `ad_id` | `adgroup_id` → `af_ad_id` → `ad_id` |
+| `af_siteid` | `af_siteid` |
+| `install_time`, `is_first_launch` | как есть: время установки и признак первого запуска |
+| `att_status` | не из GCD, из игры: ответ игрока на запрос ATT (запрос Apple на отслеживание на iOS): authorized / denied / not_determined |
+
+Параметр события вмещает имена до 100 символов. Смысловых параметров 12 — в пределах 18 ([tracking-plan.md §2.1](tracking-plan.md)).
+
+**Сырой GCD хранится целиком.** Полный JSON GCD один раз на установку пишется в хранилище Nakama (storage: коллекция `ua_gcd`, ключ — `eid` события `ua_attribution`). Если вход в Nakama ещё не выполнен, JSON ждёт в сохранении игры и пишется после входа. В BigQuery он попадает с ночной выгрузкой Nakama (`nakama_ua_gcd`). Поэтому сеть, которая кладёт свои ID под другими ключами, перекладывается в Dataform из сырого JSON, без нового билда.
+
+Поля стоимости из GCD не используются: они могут быть 0. Затраты позже придут из отчётов AppsFlyer или сетей ([tracking-plan.md §6](tracking-plan.md)). Новая установка определяется по `dim_install`, а не по `is_first_launch`.
 
 В user properties (свойства игрока в Firebase) кладём только короткие значения: `ua_source`, `ua_campaign_id`. Значение user property — не больше 36 символов [факт]. Имена кампаний длиннее этого лимита и в user property обрежутся.
 
@@ -176,8 +193,9 @@
 
 **Источник правды по выручке — MAX User-Level Ad Revenue API** (выручка по каждому показу), `aggregated=false` [факт]:
 
-- Поля: время показа, ad unit, формат, placement, страна, сеть, выручка (USD), **User Id** (= `player_id`), IDFA/IDFV, **Custom Data** (произвольное значение, которое игра передаёт вместе с показом). Колонки точности выручки (`precision`) и ID показа нет [факт]. Custom Data есть в списке полей API [факт]; приходит ли она в выгружаемом CSV, не подтверждено. Схема верна при любом ответе: без колонки выручка потока берётся из `ad_revenue_paid.revenue`, итог — по-прежнему из User-Level ([tracking-plan.md §3.6, §7](tracking-plan.md)).
-- Данные за день появляются на следующий день после 08:00 UTC. Доступны за последние 45 дней [факт].
+- Поля: время показа, ad unit, формат, placement, страна, сеть, выручка (USD), **User Id** (= `player_id`), IDFA/IDFV, **Custom Data** (произвольное значение, которое игра передаёт вместе с показом). Колонки точности выручки (`precision`) и ID показа нет [факт].
+- В примере CSV в документации заголовок `Date,Ad Unit ID,Ad Unit Name,Waterfall,Ad Format,Placement,Country,Device Type,IDFA,IDFV,User ID,Revenue, Ad Placement` — с пробелом перед последним именем; Custom Data и Network есть в таблице полей, но не в примере заголовка [факт: support.applovin.com/en/max/reporting-apis/user-level-ad-revenue-api]. Поэтому загрузчик читает CSV по именам колонок и обрезает пробелы вокруг имён. Обязательные колонки — Date, Ad Unit ID, Ad Format, Placement, Country, User ID, Revenue: если какой-то нет, загрузка падает с ошибкой. Необязательные (Custom Data, Network) используются, если есть. Ветка соединения выручки с потоком выбирается автоматически по наличию колонки Custom Data в файле: есть — строка соединяется с потоком по `show_id`; нет — выручка потока берётся из `ad_revenue_paid.revenue`. Итог в обеих ветках — из User-Level ([tracking-plan.md §3.6](tracking-plan.md)).
+- Данные за день появляются на следующий день после 08:00 UTC. Доступны за последние 45 дней [факт]. День запроса и колонка `Date` считаются в UTC: в отчётных API AppLovin все времена — UTC, данные доступны через восемь часов после конца дня UTC [факт: support.applovin.com/max/reporting-apis/revenue-reporting-api]; что `Date` в User-Level тоже UTC — [вывод]. День UTC важен только для сравнения баннерных сумм по дням в `dq`; итоги по деньгам от него не зависят.
 - Цену, условия доступа и лимиты запросов страница API не называет [не найдено]; доступ — по Report Key. Схема от ответа не зависит: это вопрос стоимости, его проверить в аккаунте MAX до запуска. Финальная ли это выручка или оценка — не указано; часть выручки в данных — оценка MAX, а не фактическая сумма: например, по ставкам Meta [факт].
 
 **Что это даёт:**
@@ -208,7 +226,16 @@ DWH от этого не зависит. Но без этих событий с�
 
 - **ROI360 не нужен.** В DefAppsFlyer нет `logAdRevenue` [факт]. Поэтому игра отправляет рекламную выручку обычным событием с `af_revenue` через `log_event` [факт: API есть]. Сумма берётся из колбэка (функции обратного вызова) `On*AdRevenuePaidEvent` в MAX. Отправлять нужно сводкой — за сессию или каждые N минут, — а не на каждый показ: так событий меньше. Если позже подключить ROI360, это событие нужно выключить, иначе выручка задвоится.
 - **IAP** — событие `af_purchase` с `af_revenue` / `af_currency` [факт], **после** серверной проверки: AppsFlyer сам покупки не валидирует.
-- **SKAN conversion values** (числа, которыми приложение сообщает Apple о поведении игрока): в Lua API для них функций нет [факт]. Если схема настроена в SKAN Conversion Studio, SDK выставляет conversion values сам, без кода; условия — свежая версия SDK и отсутствие в приложении другого SDK, который выставляет conversion values [факт: support.appsflyer.com/hc/en-us/articles/4403727223185]. `log_event` в DefAppsFlyer вызывает нативный `logEventWithEventName` [факт по коду расширения], поэтому события из схемы доходят до нативного SDK [вывод]. Доходят ли постбэки, видно только на устройстве: проверка до запуска — [tracking-plan.md §7](tracking-plan.md), п. 6.
+- **SKAN и AdAttributionKit** (conversion values — числа, которыми приложение сообщает Apple о поведении игрока): в Lua API DefAppsFlyer для них функций нет [факт]. Настройка:
+  - `NSAdvertisingAttributionReportEndpoint` = `https://appsflyer-skadnetwork.com/` уже есть в iOS-манифесте DefAppsFlyer [факт по коду расширения, manifests/ios/Info.plist].
+  - `SKAdNetworkItems` (451 ID сетей) уже есть в iOS-манифесте расширения AppLovin MAX для Defold, и его скрипт обновления их сохраняет [факт по коду расширения].
+  - `AttributionCopyEndpoint` (в Xcode — «AdAttributionKit - Postback Copy URL», iOS 17.4+, строка) нужен для копий постбэков AdAttributionKit [факт: developer.apple.com/documentation/bundleresources/information-property-list/attributioncopyendpoint]; значение для AppsFlyer — `https://appsflyer-skadnetwork.com/` [факт: dev.appsflyer.com/hc/docs/integrate-ios-sdk]. DefAppsFlyer этот ключ не добавляет [факт по коду расширения], поэтому игра добавляет его в свой шаблон Info.plist (`ios.infoplist` в game.project; манифесты расширений сливаются с ним).
+  - Схема SKAN Conversion Studio (SKAN 4) в AppsFlyer: SDK выставляет conversion values сам, без кода; ATT для SKAN не нужен [факт: support.appsflyer.com/hc/en-us/articles/4403727223185]. В схеме — те же события, которые игра шлёт в AppsFlyer (минимум ниже): покупка, рекламная выручка, завершение туториала, 2–3 вехи прогресса. `log_event` в DefAppsFlyer вызывает нативный `logEventWithEventName` [факт по коду расширения], поэтому эти события доходят до нативного SDK [вывод].
+  - Правило: ни один другой SDK в билде не вызывает API обновления conversion values SKAN / AdAttributionKit — выставлять их может только AppsFlyer [факт: support.appsflyer.com/hc/en-us/articles/4403727223185].
+  - `af_revenue` в обоих событиях выручки (выше) уходит строкой `string.format("%.2f", amount)` — точка как разделитель, без разделителя тысяч и знака валюты — вместе с `af_currency` (код ISO 4217): DefAppsFlyer передаёт значения событий в нативный код строками [факт по коду расширения, appsflyer_ios.mm].
+  - `start_sdk` на первом запуске — после ответа на ATT или по таймеру (§2).
+
+  Копии постбэков приходят только от сборки из App Store, не из TestFlight; постбэки первого окна приходят через 24–48 ч или позже [факт: Apple/AppsFlyer]. Их видно в отчёте копий постбэков AppsFlyer после релиза. DWH данные SKAN не использует (§0), поэтому на DWH это не влияет. Приёмка настройки на тестовой сборке — [tracking-plan.md §7](tracking-plan.md), п. 6.
 - **Минимум событий:** покупка, рекламная выручка, завершение туториала, 2–3 вехи прогресса. Платны ли in-app события на Growth, страница цен не говорит [не найдено]: на ней оплачиваются конверсии, органика бесплатна [факт: appsflyer.com/pricing]. Спросить AppsFlyer до запуска; ответ влияет на стоимость, а не на данные.
 - **Тариф:** Zero не подходит. Он меряет только клики и показы, без атрибуции, и для платного трафика непригоден [факт]. Подходит Growth: 12k конверсий бесплатно один раз, на первые 12 месяцев; сверх них — $0.07 за конверсию; органика бесплатна [факт: appsflyer.com/pricing]. Конверсия — платная (неорганическая) установка или повторное вовлечение, которые AppsFlyer атрибутировал.
 
@@ -263,7 +290,7 @@ DWH от этого не зависит. Но без этих событий с�
 ## 7. Что настроить и проверить у себя
 
 1. **MAX:** Report Key (ключ доступа к отчётам) для User-Level Ad Revenue API и Revenue Reporting API; проверить в аккаунте MAX цену и условия доступа User-Level API.
-2. **AppsFlyer:** тариф Growth; спросить AppsFlyer до запуска, платны ли in-app события; Aggregate Pull API платный, покупаем его только если ручной сверки по дашборду не хватит; настроить SKAN Conversion Studio и проверить на тестовой сборке, обновляет ли SDK conversion values ([tracking-plan.md §7](tracking-plan.md), п. 6).
+2. **AppsFlyer:** тариф Growth; спросить AppsFlyer до запуска, платны ли in-app события; Aggregate Pull API платный, покупаем его только если ручной сверки по дашборду не хватит; настроить схему SKAN Conversion Studio (SKAN 4) на те же события, что игра шлёт в AppsFlyer; добавить `AttributionCopyEndpoint` = `https://appsflyer-skadnetwork.com/` в шаблон Info.plist игры, остальные ключи SKAN уже есть в манифестах расширений (§4.3).
 3. **Meta:** принять условия AMM в AppsFlyer и включить Meta Install Referrer (без этого Meta на Android частично будет «органикой»).
 4. **App Store Connect:** shared secret (ключ для проверки чеков) в Nakama; URL Nakama для ASSN V2; ключ In-App Purchase API для App Store Server API (задание Get Transaction Info); ключ App Store Connect API для отчётов `salesReports` и `financeReports`; включить Game Center; вступить в Small Business Program (15%), если выручка до $1M.
 5. **Play Console:** бакет GCS (Google Cloud Storage) для отчётов; сервисный аккаунт для Developer API (тот же получает Nakama); RTDN через Pub/Sub на адрес Nakama; Play Games Services для входа.
